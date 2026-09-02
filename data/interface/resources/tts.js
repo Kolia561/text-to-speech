@@ -242,6 +242,9 @@ var tts = {
             config.audio = new SpeechSynthesisUtterance();
             config.audio.lang = code ? code : (attribute ? (attribute.indexOf('-') !== -1 ? attribute : "en-US") : "en-US");
             /*  */
+            const rate = e.rate !== undefined ? Number(e.rate) : 2.0;
+            config.audio.rate = rate;
+            /*  */
             if (voicelist) {
               for (let i = 0; i < voicelist.length; i++) {
                 if (code) {
@@ -523,6 +526,11 @@ var kokoro = {
           this.currentSource.connect(this.context.destination);
           tts.engine.highlight.add(this.sentences[this.currentIndex]);
           config.show.info("start", "Please click the speaker button to stop the playback.");
+          // apply playback speed for kokoro audio
+          const playbackRate = (config.storage.read("rate") !== undefined) ? Number(config.storage.read("rate")) : 2.0;
+          if (this.currentSource && this.currentSource.playbackRate) {
+            this.currentSource.playbackRate.value = playbackRate;
+          }
           this.currentSource.start(0);
           /*  */
           const nextIndex = this.currentIndex + this.preloadCount;

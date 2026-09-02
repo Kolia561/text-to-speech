@@ -212,6 +212,7 @@ var config = {
     config.button.backend = document.getElementById("backend");
     config.button.dialect = document.getElementById("dialect");
     config.button.language = document.getElementById("language");
+    config.button.rate = document.getElementById("rate");
     /*  */
     config.button.start.addEventListener("click", config.app.speak, false);
     config.button.size.addEventListener("change", config.app.store.size, false);
@@ -222,6 +223,7 @@ var config = {
     config.button.backend.addEventListener("change", config.app.store.backend, false);
     config.button.dialect.addEventListener("change", config.app.store.dialect, false);
     config.button.language.addEventListener("change", config.app.store.language, false);
+    config.button.rate.addEventListener("change", config.app.store.rate, false);
     /*  */
     actions.forEach(function (action) {
       config.element.input.addEventListener(action, e => e.preventDefault(), false);
@@ -316,6 +318,7 @@ var config = {
         /*  */
         config.element.input.textContent = config.app.prefs.input;
         config.button.size.value = config.app.prefs.size;
+        if (config.button.rate) config.button.rate.value = config.app.prefs.rate;
       }
     },
     "flash": {
@@ -346,13 +349,14 @@ var config = {
       set input (val) {config.storage.write("input", val)},
       set engine (val) {config.storage.write("engine", val)},
       set backend (val) {config.storage.write("backend", val)},
+      set rate (val) {config.storage.write("rate", val)},
       //
       get size () {return config.storage.read("size") !== undefined ? config.storage.read("size") : 14},
       get theme () {return config.storage.read("theme") !== undefined ? config.storage.read("theme") : "light"},
       get engine () {return config.storage.read("engine") !== undefined ? config.storage.read("engine") : "webapi"},
       get backend () {return config.storage.read("backend") !== undefined ? config.storage.read("backend") : config.isgecko ? "wasm" : "webgpu"},
       get input () {return config.storage.read("input") !== undefined ? config.storage.read("input") : "A text to speech tool with natural sounding voices"},
-      //
+      get rate () {return config.storage.read("rate") !== undefined ? config.storage.read("rate") : 2},
       "webapi": {
         set voices (val) {config.storage.write("voices", val)},
         set dialect (val) {config.storage.write("dialect", val)},
@@ -376,6 +380,9 @@ var config = {
       "size": function () {
         config.app.prefs.size = config.button.size.value;
         config.app.update.size();
+      },
+      "rate": function () {
+        config.app.prefs.rate = config.button.rate.value;
       },
       "engine": function () {
         config.app.prefs.engine = config.button.engine.value;
