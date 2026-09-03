@@ -12,6 +12,27 @@
         <tr>
           <td>
             <label>
+              <span>Text-to-Speech Engine</span>
+              <select data-pref="settings.ttsEngine">
+                <option value="edgetts">Edge TTS (Default - Popup)</option>
+                <option value="localtts">Local TTS Server</option>
+              </select>
+            </label>
+            <p class="note">Choose between Edge TTS (cloud-based, popup interface) or a local TTS server. Edge TTS is the recommended default option.</p>
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <label>
+              <span>Local TTS Server URL</span>
+              <input data-pref="settings.localServerUrl" type="text" placeholder="http://localhost:8000">
+            </label>
+            <p class="note">Only used when "Local TTS Server" engine is selected. Make sure your local server is running before using this option.</p>
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <label>
               <span>Enable text-to-speech for "input" or "editable" areas</span>
               <input data-pref="settings.enableInputArea" type="checkbox">
             </label>
@@ -24,7 +45,7 @@
               <span>Highlight text when text-to-speech is running</span>
               <input data-pref="settings.showHighlight" type="checkbox">
             </label>
-            <p class="note">For the highlight feature to work correctly, please select text paragraph-by-paragraph. Please note, highlight feature is still in Beta and may not work properly for all web-pages.</p>
+            <p class="note">For the highlight feature to work correctly, please select text paragraph-by-paragraph. Please note, highlight feature is still in Beta and may not work properly for all websites.</p>
           </td>
         </tr>
         <tr>
@@ -62,7 +83,7 @@
               <input data-pref="settings.placeholderIconTime" type="number">
               <span> second(s).</span>
             </label>
-            <p class="note">The small bubble will be hidden after few seconds if you do not click on it. Note: values equal to or greater than 60 seconds mean the bubble will not be hidden until you click somewhere within the page.</p>
+            <p class="note">The small bubble will be hidden after few seconds if you do not click on it. Note: values equal to or greater than 60 seconds mean the bubble will not be hidden until you click on it.</p>
           </td>
         </tr>
       </table>
