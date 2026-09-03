@@ -20,10 +20,26 @@ var config = {
   "render": function (e) {
     if ("pref" in e) {
       if (window[e.pref]) {
-        window[e.pref].value = e.value;
+        const element = window[e.pref];
+        
+        if (element.type === "checkbox") {
+          element.checked = e.value;
+        } else if (element.localName === "select") {
+          element.value = e.value;
+        } else if (element.localName === "input" && element.type === "text") {
+          element.value = e.value;
+        } else {
+          element.value = e.value;
+        }
+        
         if (e.pref === "settings.isBubbleIcon") {
           document.querySelector("input[data-pref='settings.placeholderIconShow']").disabled = !e.value;
           document.querySelector("input[data-pref='settings.placeholderIconTime']").disabled = !e.value;
+        }
+        
+        if (e.pref === "settings.ttsEngine") {
+          const localServerInput = document.querySelector("input[data-pref='settings.localServerUrl']");
+          localServerInput.disabled = e.value === "edgetts";
         }
       }
     }
@@ -36,6 +52,7 @@ var config = {
     if (elem) {
       if (elem.type === "checkbox") att = "checked";
       if (elem.localName === "select") att = "value";
+      if (elem.localName === "input") att = "value";
       if (elem.localName === "span") att = "textContent";
       /*  */
       pref = elem.getAttribute("data-pref");
@@ -63,6 +80,8 @@ var config = {
     const prefs = [...document.querySelectorAll("*[data-pref]")];
     const selection = document.querySelector("input[data-pref='settings.selection']");
     const isBubbleIcon = document.querySelector("input[data-pref='settings.isBubbleIcon']");
+    const ttsEngine = document.querySelector("select[data-pref='settings.ttsEngine']");
+    const localServerUrl = document.querySelector("input[data-pref='settings.localServerUrl']");
     const placeholderIconShow = document.querySelector("input[data-pref='settings.placeholderIconShow']");
     const placeholderIconTime = document.querySelector("input[data-pref='settings.placeholderIconTime']");
     /*  */
@@ -73,7 +92,11 @@ var config = {
     /*  */
     const _set = function (elm, pref, value) {
       if (!elm) return;
-      elm.checked = value;
+      if (elm.type === "checkbox") {
+        elm.checked = value;
+      } else {
+        elm.value = value;
+      }
       background.send("changed", {
         "pref": pref, 
         "value": value
@@ -93,6 +116,16 @@ var config = {
       placeholderIconTime.disabled = !e.target.checked;
       _set(isBubbleIcon, "settings.isBubbleIcon", e.target.checked);
     }, false);
+    /*  */
+    if (ttsEngine) {
+      ttsEngine.addEventListener("change", function (e) {
+        _set(ttsEngine, "settings.ttsEngine", e.target.value);
+        // Disable/enable local server URL input based on engine selection
+        if (localServerUrl) {
+          localServerUrl.disabled = e.target.value === "edgetts";
+        }
+      }, false);
+    }
     /*  */
     window.removeEventListener("load", config.load, false);
   }
