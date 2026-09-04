@@ -1,259 +1,400 @@
-importScripts("lib/config.js");
-importScripts("lib/chrome.js");
-importScripts("lib/runtime.js");
-importScripts("lib/common.js");
+/*
+ * Read Aloud — service worker
+ *
+ * Responsibilities:
+ *  - Own the single offscreen audio document that plays the audio returned
+ *    by an (Edge) TTS HTTP server.
+ *  - Synthesize one paragraph at a time: fetch the audio for the text, hand
+ *    it to the offscreen document and let it play.
+ *  - Relay natural playback completion ("ended") and errors back to the tab
+ *    whose content script requested the paragraph, so it can advance the
+ *    highlight to the next paragraph.
+ *  - Toolbar / context-menu / keyboard-shortcut entry point: ask the tab's
+ *    content script to toggle reading, to start/jump reading at the
+ *    paragraph the user right-clicked, or to start reading at the first
+ *    paragraph visible in the viewport (injecting on demand when needed).
+ */
 
-let isRecording = false;
-let currentPlayerState = 'stopped';
-let creating = null; // A global promise to avoid concurrency issues
+'use strict';
 
-async function setupOffscreenDocument() {
-  // Check all windows controlled by the service worker to see if one
-  // of them is the offscreen document with the given path
-  const path = 'data/interface/offscreen.html';
-  const offscreenUrl = chrome.runtime.getURL(path);
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [offscreenUrl],
+const OFESCREEN_PATH = 'data/interface/offscreen.html';
+const OFESCREEN_URL = chrome.runtime.getURL(OFESCREEN_PATH);
+
+let creating = null;              // promise guarding offscreen creation
+let currentSession = null;        // {tabId, frameId} of the active paragraph requester
+let currentParaId = 0;            // token of the paragraph audio currently in flight
+
+/* The service worker may be suspended and restarted between the moment a
+ * paragraph is requested and the moment its audio finishes playing. The two
+ * values above then reset, so the "paragraph ended" event would be dropped as
+ * stale and reading would stall silently (audio stops after the current
+ * paragraph because nothing advances to the next one). They are mirrored to
+ * storage.session (which survives worker restarts) so an "ended" event can be
+ * matched and forwarded even after a restart. */
+const PLAYBACK_SESSION_KEY = 'ra:playbackSession';
+const PLAYBACK_PARA_KEY = 'ra:playbackParaId';
+let persistedPlayback = null;       // cached { session, paraId } from storage.session
+let persistedPlaybackLoaded = false;
+
+function cachePlayback(session, paraId) {
+  persistedPlayback = { session: session, paraId: paraId };
+  persistedPlaybackLoaded = true;
+  try {
+    chrome.storage.session.set({
+      [PLAYBACK_SESSION_KEY]: session,
+      [PLAYBACK_PARA_KEY]: paraId
+    });
+  } catch (e) { /* storage.session unavailable — in-memory values still work */ }
+}
+
+function loadPlayback() {
+  if (persistedPlaybackLoaded) return Promise.resolve(persistedPlayback);
+  return new Promise((resolve) => {
+    if (!chrome.storage || !chrome.storage.session) {
+      persistedPlayback = null;
+      persistedPlaybackLoaded = true;
+      resolve(null);
+      return;
+    }
+    try {
+      chrome.storage.session.get([PLAYBACK_SESSION_KEY, PLAYBACK_PARA_KEY], (res) => {
+        void chrome.runtime.lastError; // swallow "session storage cleared" errors
+        persistedPlayback = {
+          session: (res && res[PLAYBACK_SESSION_KEY]) || null,
+          paraId: (typeof (res && res[PLAYBACK_PARA_KEY]) === 'number')
+            ? res[PLAYBACK_PARA_KEY]
+            : null
+        };
+        persistedPlaybackLoaded = true;
+        resolve(persistedPlayback);
+      });
+    } catch (e) {
+      persistedPlayback = null;
+      persistedPlaybackLoaded = true;
+      resolve(null);
+    }
+  });
+}
+
+/* Small LRU cache of fetched paragraph audio, keyed by paragraph request id.
+ * The content script pre-fetches the *next* paragraph while the current one
+ * plays, so consecutive paragraphs (and "next" presses) start instantly. */
+const audioCache = new Map();     // paraId -> { buffer, mime, fp }
+const CACHE_MAX = 6;
+
+function fingerprint(settings) {
+  return [
+    settings && settings.serverUrl,
+    settings && settings.voice,
+    settings && settings.speed,
+    settings && settings.model
+  ].join('|');
+}
+
+function cacheGet(paraId, fp) {
+  const hit = audioCache.get(paraId);
+  if (hit && hit.fp === fp) return hit;
+  return null;
+}
+
+function cachePut(paraId, fp, buffer, mime) {
+  // A change of voice/speed/server invalidates all cached audio.
+  if (audioCache.size && [...audioCache.values()].some((c) => c.fp !== fp)) {
+    audioCache.clear();
+  }
+  audioCache.set(paraId, { buffer: buffer, mime: mime, fp: fp });
+  while (audioCache.size > CACHE_MAX) {
+    const oldest = audioCache.keys().next().value;
+    audioCache.delete(oldest);
+  }
+}
+
+async function fetchParagraphAudio(text, settings) {
+  const response = await fetch(settings.serverUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'audio/mpeg, audio/wav, audio/*'
+    },
+    body: JSON.stringify({
+      model: settings.model || 'tts-1',
+      voice: settings.voice || '',
+      input: text,
+      speed: Number.parseFloat(settings.speed) || 1
+    })
   });
 
-  if (existingContexts.length > 0) {
-    return;
+  if (!response.ok) {
+    let reason = 'TTS server responded with HTTP ' + response.status;
+    try {
+      const body = await response.text();
+      if (body && body.length < 400) reason += ': ' + body.trim();
+    } catch (e) { /* not a text body */ }
+    throw new Error(reason);
   }
 
-  // create offscreen document
-  if (creating) {
-    await creating;
-  } else {
+  return {
+    buffer: await response.arrayBuffer(),
+    mime: response.headers.get('Content-Type') || 'audio/mpeg'
+  };
+}
+
+/* ---------------- offscreen document ---------------- */
+
+async function ensureOffscreen() {
+  const existing = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [OFESCREEN_URL]
+  });
+  if (existing.length > 0) return;
+
+  if (!creating) {
     creating = chrome.offscreen.createDocument({
-      url: path,
+      url: OFESCREEN_URL,
       reasons: ['AUDIO_PLAYBACK'],
-      justification: 'Playing TTS audio in the background'
+      justification: 'Play TTS audio (Edge TTS server output) in the background'
     });
+  }
+  try {
     await creating;
+  } finally {
     creating = null;
   }
 }
 
-// Set up context menu items
-function setupContextMenu() {
-  try{
-  chrome.contextMenus.create({
-    id: "readAloud",
-    title: "Read Aloud",
-    contexts: ["selection", "page"]
+/* ---------------- messaging helpers ---------------- */
+
+function sendToOffscreen(message) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(message, () => {
+        void chrome.runtime.lastError; // swallow "no receiving end" errors
+        resolve();
+      });
+    } catch (e) {
+      resolve();
+    }
   });
-  }catch(error){console.error('Already created',error)}
 }
 
-// Handle context menu clicks
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "readAloud") {
-    let text = info.selectionText;
-
-    if (!text) {
-      // If no text is selected, get the page content
-      chrome.scripting.executeScript({
-        target: { tabId: tab?.id },
-        function: () => {
-          return document.body.innerText;
-        }
-      }).then(results => {
-        if (results && results[0] && results[0].result) {
-          processAndReadText(results[0].result, tab.id);
-        }
-      });
-    } else {
-      // Use the selected text
-      processAndReadText(text, tab.id);
-    }
-  }
-});
-
-// Process and read text with default settings
-async function processAndReadText(text, tabId) {
-  try {
-    // Get default settings
-    const settings = await chrome.storage.local.get({
-      serverUrl: 'http://localhost:5050/v1/audio/speech',
-      voice: 'af_bella',
-      speed: 2.0,
-      recordAudio: false,
-      preprocessText: true
-    });
-
-    // Process text if enabled
-    if (settings.preprocessText && tabId) {
-      try {
-        // Inject the text processor script if needed
-        await chrome.scripting.executeScript({
-          target: { tabId: tabId },
-          files: ['textProcessor.js']
-        });
-
-        // Process the text
-        const result = await chrome.scripting.executeScript({
-          target: { tabId: tabId },
-          func: (textToProcess) => {
-            return TextProcessor.process(textToProcess);
-          },
-          args: [text]
-        });
-
-        if (result?.[0]?.result) {
-          text = result[0].result;
-        }
-      } catch (error) {
-        console.error('Error processing text:', error);
-        // Fall back to using the original text
-      }
-    }
-
-    // Set state to loading
-    currentPlayerState = 'loading';
-    chrome.runtime.sendMessage({
-      type: 'playerStateUpdate',
-      state: 'loading'
-    });
-
-    // Start streaming audio
-    startStreamingAudio(text, settings);
-  } catch (error) {
-    console.error('Error in processAndReadText:', error);
-    chrome.runtime.sendMessage({
-      type: 'streamError',
-      error: error.message
-    });
-  }
+function sessionOf(sender) {
+  if (!sender || !sender.tab) return null;
+  return {
+    tabId: sender.tab.id,
+    frameId: sender.frameId != null ? sender.frameId : 0
+  };
 }
 
-// Handle messages from popup or offscreen document
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  switch (message.type) {
-    case 'setupOffscreen':
-      setupOffscreenDocument().then(() => sendResponse({ success: true }));
-      return true;
+function notifyContent(session, event, detail, paraId) {
+  if (!session) return;
+  chrome.tabs.sendMessage(
+    session.tabId,
+    { type: 'tts-event', event: event, detail: detail || null, paraId: paraId },
+    { frameId: session.frameId }
+  ).catch(() => {
+    // Tab navigated away or was closed while audio finished — nothing to update.
+  });
+}
 
-    case 'startStreaming':
-      isRecording = message.record;
-      // Set state to loading before starting the audio stream
-      currentPlayerState = 'loading';
-      chrome.runtime.sendMessage({
-        type: 'playerStateUpdate',
-        state: 'loading'
-      });
-      startStreamingAudio(message.text, message.settings);
-      sendResponse({ success: true });
-      return true;
+/* ---------------- TTS paragraph playback ---------------- */
 
-    case 'controlAudio':
-      chrome.runtime.sendMessage({
-        type: message.action,
-        data: message.data
-      });
-      return true;
-
-    case 'stateUpdate':
-      currentPlayerState = message.state;
-      chrome.runtime.sendMessage({
-        type: 'playerStateUpdate',
-        state: message.state
-      });
-      return true;
-
-    case 'audioReady':
-      // Audio is ready but not yet playing
-      if (currentPlayerState === 'loading') {
-        currentPlayerState = 'ready';
-        chrome.runtime.sendMessage({
-          type: 'playerStateUpdate',
-          state: 'ready'
-        });
-      }
-      return true;
-
-    case 'getPlayerState':
-      sendResponse({ state: currentPlayerState });
-      return true;
-
-    case 'seek':
-      chrome.runtime.sendMessage({
-        type: 'seek',
-        time: message.time
-      }, (response) => {
-        sendResponse(response);
-      });
-      return true;
-
-    case 'getTimeInfo':
-      chrome.runtime.sendMessage({
-        type: 'getTimeInfo'
-      }).then((response) => {
-        sendResponse(response);
-      });
-      return true;
-
-    case 'timeUpdate':
-      // Forward time updates to the popup
-      chrome.runtime.sendMessage(message);
-      return true;
+async function playParagraph(sender, text, settings, paraId, natural) {
+  const session = sessionOf(sender);
+  if (!session) {
+    notifyContent(session, 'error', 'Missing tab context.');
+    return;
   }
-});
+  currentSession = session;
+  const sessionParaId = (typeof paraId === 'number') ? paraId : (currentParaId + 1);
+  currentParaId = sessionParaId;
+  cachePlayback(session, currentParaId);
+  const fp = fingerprint(settings);
 
-// Start streaming audio from the TTS server
-async function startStreamingAudio(text, settings) {
+  const serverUrl = settings && settings.serverUrl;
+  if (!serverUrl) {
+    notifyContent(session, 'error', 'TTS server URL is not set.');
+    return;
+  }
+
   try {
-    await setupOffscreenDocument();
+    await ensureOffscreen();
 
-    const response = await fetch(settings.serverUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg, audio/wav, audio/*'
-      },
-      body: JSON.stringify({
-        model: 'tts-1',
-        voice: settings.voice,
-        input: text,
-        speed: Number.parseFloat(settings.speed)
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+    // After a paragraph ended naturally the offscreen document has already
+    // cleared its source, so a redundant "stop" only adds latency. Interrupts
+    // (skip / jump / restart) always stop first.
+    if (!natural) {
+      await sendToOffscreen({ type: 'stop' });
     }
 
-    // Get the audio data as a blob
-    const audioBlob = await response.blob();
-    const mimeType = audioBlob.type || 'audio/mpeg';
+    // Prefer a pre-fetched copy of this paragraph when available.
+    let audio = cacheGet(sessionParaId, fp);
+    if (!audio) {
+      audio = await fetchParagraphAudio(text, settings);
+      cachePut(sessionParaId, fp, audio.buffer, audio.mime);
+    }
 
-    // Convert blob to array buffer to send to offscreen document
-    const arrayBuffer = await audioBlob.arrayBuffer();
-
-    // Send the audio data to the offscreen document
-    chrome.runtime.sendMessage({
+    await sendToOffscreen({
       type: 'processAudioData',
-      audioData: Array.from(new Uint8Array(arrayBuffer)),
-      mimeType: mimeType,
-      isRecording: isRecording
+      audioData: audio.buffer,
+      mimeType: audio.mime,
+      token: currentParaId
     });
   } catch (error) {
-    console.error('Error streaming audio:', error);
-    chrome.runtime.sendMessage({
-      type: 'streamError',
-      error: error.message
-    });
-
-    // Update state to stopped on error
-    currentPlayerState = 'stopped';
-    chrome.runtime.sendMessage({
-      type: 'playerStateUpdate',
-      state: 'stopped'
-    });
+    console.error('[read-aloud] paragraph synthesis failed:', error);
+    const message = error && error.message ? error.message : String(error);
+    notifyContent(session, 'error', message, currentParaId);
   }
 }
 
-// Initialize context menu when extension is installed or updated
-chrome.runtime.onInstalled.addListener(() => {
-  setupContextMenu();
+/* Fire-and-forget pre-fetch of the next paragraph's audio. */
+async function prefetchParagraph(paraId, text, settings) {
+  if (!settings || !settings.serverUrl || typeof paraId !== 'number') return;
+  const fp = fingerprint(settings);
+  if (cacheGet(paraId, fp)) return;
+  try {
+    const audio = await fetchParagraphAudio(text, settings);
+    cachePut(paraId, fp, audio.buffer, audio.mime);
+  } catch (e) {
+    // Pre-fetch is best-effort; playback will fetch on demand if it fails.
+  }
+}
+
+async function controlParagraph(action) {
+  const offscreenAction = action === 'pause' ? 'pause' : action === 'resume' ? 'play' : action === 'stop' ? 'stop' : null;
+  if (offscreenAction) await sendToOffscreen({ type: offscreenAction });
+}
+
+/* ---------------- entry points ---------------- */
+
+async function ensureReaderInTab(tabId, messageType) {
+  messageType = messageType || 'reader-toggle';
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: messageType });
+    return;
+  } catch (e) {
+    // No content script in this tab yet — inject on demand and retry once.
+  }
+  try {
+    // Injecting with chrome.scripting only runs the JS, so the bar styles
+    // must be inserted explicitly too (manifest CSS only applies to pages
+    // that were loaded with the content script registered).
+    await chrome.scripting.insertCSS({
+      target: { tabId: tabId },
+      files: ['data/content_script/reader.css']
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: ['data/content_script/reader.js']
+    });
+    await chrome.tabs.sendMessage(tabId, { type: messageType });
+  } catch (e) {
+    // Unsupported page (chrome://, Web Store, ...) — nothing we can do.
+  }
+}
+
+chrome.action.onClicked.addListener((tab) => {
+  if (tab && tab.id != null) ensureReaderInTab(tab.id, 'reader-toggle');
 });
+
+// Keyboard shortcut (Alt+Shift+R by default, rebindable at
+// chrome://extensions/shortcuts). Unlike the context menu there is no
+// "right-clicked here", so the reader starts at the first paragraph that is
+// visible in the current tab's viewport.
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener((command) => {
+    if (command !== 'read-aloud-start-visible') return;
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs && tabs[0];
+      if (tab && tab.id != null) {
+        ensureReaderInTab(tab.id, 'reader-start-visible');
+      }
+    });
+  });
+}
+
+// Context menus persist for the lifetime of the extension, so they are only
+// (re)created on install/update, never on every service-worker wake-up.
+chrome.runtime.onInstalled.addListener(() => {
+  if (!chrome.contextMenus) return;
+  try {
+    chrome.contextMenus.create({
+      id: 'read-aloud',
+      title: 'Read Aloud',
+      contexts: ['page', 'selection']
+    });
+    chrome.contextMenus.create({
+      id: 'read-aloud-here',
+      title: 'Start reading from here',
+      contexts: ['page', 'selection']
+    });
+  } catch (e) {
+    // Items already exist (should not happen after install/update).
+  }
+});
+
+if (chrome.contextMenus) {
+  chrome.contextMenus.onClicked.addListener((info, tab) => {
+    if (!tab || tab.id == null) return;
+    if (info.menuItemId === 'read-aloud') {
+      ensureReaderInTab(tab.id, 'reader-toggle');
+    } else if (info.menuItemId === 'read-aloud-here') {
+      ensureReaderInTab(tab.id, 'reader-start-here');
+    }
+  });
+}
+
+/* ---------------- message router ---------------- */
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || message.type !== 'tts-para') return;
+
+  switch (message.action) {
+    case 'play':
+      playParagraph(sender, message.text, message.settings, message.paraId, !!message.natural);
+      break;
+    case 'prefetch':
+      prefetchParagraph(message.paraId, message.text, message.settings);
+      break;
+    case 'pause':
+    case 'resume':
+    case 'stop':
+      controlParagraph(message.action);
+      break;
+  }
+  sendResponse({ ok: true });
+  return false;
+});
+
+/* ---------------- offscreen -> content events ---------------- */
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (!message || !message.type) return;
+
+  // These events are sent by the offscreen document (no sender tab). Only
+  // forward what the content script genuinely needs: the natural end of a
+  // paragraph and playback errors. Every other state change originates in
+  // the content script itself, so relaying it would only cause flicker.
+  if (message.type === 'playerEnded') {
+    void forwardPlaybackEvent('ended', message.token, null);
+  } else if (message.type === 'streamError') {
+    void forwardPlaybackEvent('error', message.token, message.error || 'Audio playback failed');
+  }
+});
+
+/**
+ * Forward an offscreen playback event to the content script that owns the
+ * currently playing paragraph. Falls back to the values persisted when the
+ * paragraph was requested, so the event still reaches the right tab after a
+ * service-worker restart (otherwise reading silently stalls at the end of
+ * the current paragraph).
+ */
+async function forwardPlaybackEvent(event, token, detail) {
+  const saved = await loadPlayback();
+  const session = currentSession || (saved && saved.session) || null;
+  const paraId = (currentParaId !== 0) ? currentParaId : (saved ? saved.paraId : null);
+
+  // Only forward when the event belongs to the paragraph we are playing
+  // right now; stale events from an earlier paragraph are dropped.
+  if (token !== undefined && token !== null && paraId != null && token !== paraId) return;
+  notifyContent(session, event, detail, paraId);
+}

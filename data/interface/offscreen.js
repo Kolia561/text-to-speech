@@ -1,132 +1,95 @@
+/*
+ * Read Aloud — offscreen audio document
+ *
+ * Plays one paragraph of audio at a time. The service worker fetches the
+ * audio from the (Edge) TTS server and hands the raw bytes to this page via
+ * "processAudioData". Events that matter for the reader are reported back:
+ *
+ *   playerEnded    — the current paragraph finished playing naturally
+ *   streamError    — playback failed
+ *
+ * All pause/play/stop transitions are initiated from the content script, so
+ * no state events are echoed back (they would only cause UI flicker).
+ */
+
+'use strict';
+
 const audioElement = document.getElementById('audioElement');
+let currentUrl = null;
+let currentToken = null;
 
-// Process audio data received from background script
-function processAudioData(audioDataArray, mimeType, isRecording) {
-  try {
-    // Convert array back to Uint8Array
-    const uint8Array = new Uint8Array(audioDataArray);
-
-    // Create blob from the array
-    const blob = new Blob([uint8Array], { type: mimeType });
-
-    // Create URL for the blob
-    const audioUrl = URL.createObjectURL(blob);
-
-    // If recording is enabled, send URL back for download
-    if (isRecording) {
-      chrome.runtime.sendMessage({
-        type: 'recordingComplete',
-        audioUrl: audioUrl
-      });
-    }
-
-    // Play the audio
-    playAudioUrl(audioUrl);
-
-    // Notify that audio is ready to play
-    chrome.runtime.sendMessage({ type: 'audioReady' });
-  } catch (error) {
-    console.error('Error processing audio data:', error);
-    chrome.runtime.sendMessage({
-      type: 'streamError',
-      error: error.message
-    });
+function clearSource() {
+  audioElement.pause();
+  if (currentUrl) {
+    URL.revokeObjectURL(currentUrl);
+    currentUrl = null;
   }
+  audioElement.removeAttribute('src');
+  audioElement.load();
 }
 
-// Play audio from URL
 function playAudioUrl(audioUrl) {
   try {
-    console.log('Playing audio URL:', audioUrl);
-
-    // Set up audio element
+    clearSource();
+    currentUrl = audioUrl;
     audioElement.src = audioUrl;
-
-    // Start playing
-    audioElement.play().catch(err => {
-      console.error('Play error:', err);
-      chrome.runtime.sendMessage({
-        type: 'streamError',
-        error: err.message
+    const p = audioElement.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch((err) => {
+        chrome.runtime.sendMessage({ type: 'streamError', token: currentToken, error: err && err.message ? err.message : String(err) });
       });
-    });
+    }
   } catch (error) {
-    console.error('Error playing audio URL:', error);
-    chrome.runtime.sendMessage({
-      type: 'streamError',
-      error: error.message
-    });
+    chrome.runtime.sendMessage({ type: 'streamError', token: currentToken, error: error && error.message ? error.message : String(error) });
   }
 }
 
-// Get current time and duration
-function getTimeInfo() {
-  return {
-    currentTime: audioElement.currentTime,
-    duration: audioElement.duration
-  };
+function processAudioData(audioData, mimeType, token) {
+  try {
+    currentToken = (typeof token === 'number') ? token : null;
+    let blob;
+    if (ArrayBuffer.isView(audioData)) {
+      blob = new Blob([audioData], { type: mimeType });
+    } else if (audioData instanceof ArrayBuffer) {
+      blob = new Blob([audioData], { type: mimeType });
+    } else if (Array.isArray(audioData)) {
+      blob = new Blob([new Uint8Array(audioData)], { type: mimeType });
+    } else {
+      throw new Error('Unsupported audio payload.');
+    }
+    playAudioUrl(URL.createObjectURL(blob));
+  } catch (error) {
+    chrome.runtime.sendMessage({ type: 'streamError', token: currentToken, error: error && error.message ? error.message : String(error) });
+  }
 }
 
-// Seek to a specific time
-function seekTo(time) {
-  audioElement.currentTime = time;
-}
-
-// Handle messages from the background script
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  console.log('Offscreen received message:', message.type);
-
   switch (message.type) {
     case 'processAudioData':
-      if (message.audioData) {
-        processAudioData(message.audioData, message.mimeType, message.isRecording);
-      }
+      if (message.audioData) processAudioData(message.audioData, message.mimeType || 'audio/mpeg', message.token);
       break;
-
     case 'play':
-      audioElement.play();
+      audioElement.play().catch(() => {});
       break;
-
     case 'pause':
       audioElement.pause();
       break;
-
     case 'stop':
-      audioElement.pause();
-      audioElement.currentTime = 0;
-      chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'stopped' });
+      clearSource();
+      chrome.runtime.sendMessage({ type: 'playerStopped', token: currentToken });
       break;
-
-    case 'seek': {
-      seekTo(message.time);
-      return true;
-    }
-    case 'getTimeInfo':
-      sendResponse({ timeInfo: getTimeInfo() });
-      return true;
   }
+  sendResponse({ ok: true });
 });
 
-// Initialize audio event handlers
-audioElement.onplay = () => {
-  chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'playing' });
-};
-
-audioElement.onpause = () => {
-  chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'paused' });
-};
+audioElement.onplay = () => {};
+audioElement.onpause = () => {};
 
 audioElement.onended = () => {
-  chrome.runtime.sendMessage({ type: 'stateUpdate', state: 'stopped' });
-};
-
-// Add timeupdate event for seeking
-audioElement.ontimeupdate = () => {
-  chrome.runtime.sendMessage({
-    type: 'timeUpdate',
-    timeInfo: {
-      currentTime: audioElement?.currentTime ?? 0,
-      duration: audioElement?.duration ?? 0
-    }
-  });
+  if (currentUrl) {
+    URL.revokeObjectURL(currentUrl);
+    currentUrl = null;
+  }
+  audioElement.removeAttribute('src');
+  chrome.runtime.sendMessage({ type: 'playerEnded', token: currentToken });
 };

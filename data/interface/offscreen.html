@@ -1,25 +1,20 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Audio Player</title>
+  <meta charset="utf-8">
+  <title>Read Aloud — Audio Player</title>
   <style>
-    body {
+    html, body {
       margin: 0;
       padding: 0;
-      background-color: #000;
+      background: #000;
       overflow: hidden;
     }
-    
-    #audioElement {
-      position: absolute;
-      bottom: 10px;
-      left: 10px;
-      z-index: 10;
-    }
+    #audioElement { position: absolute; left: -9999px; top: 0; }
   </style>
 </head>
 <body>
-  <audio id="audioElement" controls></audio>
-  <script src="data/interface/offscreen.js"></script>
+  <audio id="audioElement"></audio>
+  <script src="offscreen.js"></script>
 </body>
 </html>
